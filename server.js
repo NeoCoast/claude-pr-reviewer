@@ -67,14 +67,39 @@ if (!SMEE_URL || !WEBHOOK_SECRET) {
 // ─── smee.io forwarding ───────────────────────────────────────────────────────
 
 const SmeeClient = require('smee-client');
-const smee = new SmeeClient({
-  source: SMEE_URL,
-  target: `http://localhost:${PORT}/webhook`,
-  logger: { info: () => {}, error: (...a) => log.error('[smee]', ...a) },
-});
-const smeeHandle = smee.start();
 
-log.info(`smee.io ${SMEE_URL} → localhost:${PORT}/webhook`);
+let smeeHandle;
+let lastSmeeActivity = Date.now();
+// Reconnect if no SSE activity for 60 min (catches zombie connections where TCP is ESTABLISHED
+// but the SSE stream has silently stalled, e.g. after a NAT idle timeout through a VPN).
+const SMEE_STALE_MS = 60 * 60 * 1000;
+
+function startSmee() {
+  if (smeeHandle) {
+    try { smeeHandle.close(); } catch { /* ignore */ }
+  }
+  const smee = new SmeeClient({
+    source: SMEE_URL,
+    target: `http://localhost:${PORT}/webhook`,
+    logger: { info: () => {}, error: (...a) => log.error('[smee]', ...a) },
+  });
+  smeeHandle = smee.start();
+  smeeHandle.addEventListener('message', () => { lastSmeeActivity = Date.now(); });
+  smeeHandle.addEventListener('open', () => { log.info('[smee] connected'); lastSmeeActivity = Date.now(); });
+  smeeHandle.addEventListener('error', (err) => { log.error('[smee] error', err?.message ?? err); });
+  log.info(`smee.io ${SMEE_URL} → localhost:${PORT}/webhook`);
+}
+
+startSmee();
+
+// Watchdog: reconnect when the SSE stream has been silent for SMEE_STALE_MS
+setInterval(() => {
+  const staleSecs = Math.round((Date.now() - lastSmeeActivity) / 1000);
+  if (Date.now() - lastSmeeActivity > SMEE_STALE_MS) {
+    log.warn(`[smee] no activity for ${staleSecs}s — reconnecting...`);
+    startSmee();
+  }
+}, 60_000);
 
 // ─── Async spawn helper ───────────────────────────────────────────────────────
 
@@ -305,10 +330,38 @@ const server = app.listen(PORT, '127.0.0.1', () => {
   log.info(`listening on localhost:${PORT}`);
 });
 
+const SHUTDOWN_TIMEOUT_MS = 10 * 60 * 1000; // 10 min hard limit
+
 function shutdown() {
-  log.info('shutting down...');
-  smeeHandle.close();
-  server.close(() => process.exit(0));
+  const pending = activeReviews + reviewQueue.length;
+  log.info(`shutting down... (active=${activeReviews} queued=${reviewQueue.length})`);
+
+  // Stop accepting new webhooks and new smee events immediately
+  try { smeeHandle.close(); } catch { /* ignore */ }
+  server.close();
+
+  if (pending === 0) {
+    process.exit(0);
+    return;
+  }
+
+  log.info(`waiting for ${pending} review(s) to finish before exit...`);
+
+  const hardTimeout = setTimeout(() => {
+    log.warn('hard shutdown timeout reached — exiting with pending reviews');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  hardTimeout.unref();
+
+  // Poll until queue and active reviews both reach zero
+  const interval = setInterval(() => {
+    if (activeReviews === 0 && reviewQueue.length === 0) {
+      clearInterval(interval);
+      clearTimeout(hardTimeout);
+      log.info('all reviews done — exiting cleanly');
+      process.exit(0);
+    }
+  }, 2_000);
 }
 
 process.on('SIGTERM', shutdown);
