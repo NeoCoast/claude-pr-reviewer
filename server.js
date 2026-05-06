@@ -195,6 +195,12 @@ app.post('/webhook', (req, res) => {
   const prNumber = payload.pull_request?.number;
   const prTitle  = payload.pull_request?.title ?? '';
 
+  const prAuthor = payload.pull_request?.user?.login;
+  if (config.allowedAuthors?.length > 0 && !config.allowedAuthors.includes(prAuthor)) {
+    log.info(`PR #${prNumber} by @${prAuthor} not in allowedAuthors — ignored`);
+    return res.sendStatus(200);
+  }
+
   if (!repo || typeof prNumber !== 'number') {
     log.warn('malformed payload — missing repo or PR number');
     return res.sendStatus(400);
