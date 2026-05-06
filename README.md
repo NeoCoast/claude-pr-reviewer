@@ -47,6 +47,7 @@ Edit `config.json`:
     "myorg/backend",
     "myorg/frontend"
   ],
+  "allowedAuthors": ["your-github-username"],
   "port": 7842,
   "claudeAgent": "code-reviewer",
   "claudeModel": "claude-sonnet-4-6",
@@ -122,6 +123,7 @@ Merge recommendation: BLOCK / APPROVE WITH SUGGESTIONS / APPROVE
 | Key | Default | Description |
 |---|---|---|
 | `repos` | `[]` | List of `org/repo` strings to monitor |
+| `allowedAuthors` | `[]` | Only review PRs created by these GitHub usernames. Empty = review all authors |
 | `port` | `7842` | Local port for the webhook server |
 | `claudeAgent` | `"code-reviewer"` | Name of the Claude agent to use |
 | `claudeModel` | `"claude-sonnet-4-6"` | Claude model |
