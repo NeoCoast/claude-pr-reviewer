@@ -2,83 +2,129 @@
 # setup.sh — generates smee URL, creates .env, and registers GitHub webhooks
 # for every repo listed in config.json
 
-set -euo pipefail
+set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$ROOT/.env"
-CONFIG_FILE="$ROOT/config.json"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly ENV_FILE="$SCRIPT_DIR/.env"
+readonly CONFIG_FILE="$SCRIPT_DIR/config.json"
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+log_info()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] INFO  $*"; }
+log_warn()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] WARN  $*" >&2; }
+log_error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR $*" >&2; }
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
 
-for cmd in gh node curl openssl; do
-  if ! command -v "$cmd" &>/dev/null; then
-    echo "❌ '$cmd' not found — please install it first"
+check_dependencies() {
+  local -a missing=()
+  local -a required=(gh node curl openssl)
+
+  for cmd in "${required[@]}"; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Missing required commands: ${missing[*]}"
     exit 1
   fi
-done
+}
+
+check_dependencies
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "❌ config.json not found — copy config.example.json to config.json and edit it"
+  log_error "config.json not found — copy config.example.json to config.json and edit it"
   exit 1
 fi
 
 # Read repos array from config.json
-REPOS=$(node -e "console.log(require('$CONFIG_FILE').repos.join('\n'))")
-REPO_COUNT=$(echo "$REPOS" | wc -l | tr -d ' ')
+mapfile -t REPOS < <(node -e "
+  const cfg = require('$CONFIG_FILE');
+  if (!Array.isArray(cfg.repos) || cfg.repos.length === 0) {
+    process.stderr.write('ERROR: config.json repos array is empty\n');
+    process.exit(1);
+  }
+  cfg.repos.forEach(r => console.log(r));
+")
+
+readonly REPO_COUNT="${#REPOS[@]}"
 
 # ─── Smee URL ─────────────────────────────────────────────────────────────────
 
+SMEE_URL=""
+WEBHOOK_SECRET=""
+
 if [[ -f "$ENV_FILE" ]] && grep -q "^SMEE_URL=" "$ENV_FILE"; then
-  set -a; source "$ENV_FILE"; set +a
-  echo "✅ Reusing SMEE_URL: $SMEE_URL"
+  SMEE_URL="$(grep "^SMEE_URL=" "$ENV_FILE" | cut -d= -f2-)"
+  log_info "Reusing SMEE_URL: $SMEE_URL"
 else
-  echo "🔗 Creating smee.io channel..."
-  SMEE_URL=$(curl -Ls -o /dev/null -w '%{url_effective}' https://smee.io/new)
-  [[ -z "$SMEE_URL" || "$SMEE_URL" == "https://smee.io/new" ]] && {
-    echo "❌ Failed to create smee.io channel"
+  log_info "Creating smee.io channel..."
+  SMEE_URL="$(curl -Ls --max-time 15 -o /dev/null -w '%{url_effective}' https://smee.io/new)"
+
+  if [[ -z "$SMEE_URL" || "$SMEE_URL" == "https://smee.io/new" ]]; then
+    log_error "Failed to create smee.io channel — check network connectivity"
     exit 1
-  }
-  echo "✅ Channel: $SMEE_URL"
+  fi
+
+  if [[ ! "$SMEE_URL" =~ ^https://smee\.io/.+ ]]; then
+    log_error "Unexpected smee.io URL format: $SMEE_URL"
+    exit 1
+  fi
+
+  log_info "Channel created: $SMEE_URL"
 fi
 
 # ─── Webhook secret ───────────────────────────────────────────────────────────
 
-if [[ -z "${WEBHOOK_SECRET:-}" ]]; then
-  WEBHOOK_SECRET=$(openssl rand -hex 32)
-  echo "✅ Generated WEBHOOK_SECRET"
+if [[ -f "$ENV_FILE" ]] && grep -q "^WEBHOOK_SECRET=" "$ENV_FILE"; then
+  WEBHOOK_SECRET="$(grep "^WEBHOOK_SECRET=" "$ENV_FILE" | cut -d= -f2-)"
+  log_info "Reusing WEBHOOK_SECRET"
 else
-  echo "✅ Reusing WEBHOOK_SECRET"
+  WEBHOOK_SECRET="$(openssl rand -hex 32)"
+  log_info "Generated new WEBHOOK_SECRET"
 fi
 
-# Write .env
-cat > "$ENV_FILE" <<EOF
+# Write .env atomically
+TMPENV="$(mktemp)"
+trap 'rm -f -- "$TMPENV"' EXIT
+
+cat > "$TMPENV" <<EOF
 SMEE_URL=$SMEE_URL
 WEBHOOK_SECRET=$WEBHOOK_SECRET
 EOF
-echo ""
-echo "📝 .env saved"
+mv "$TMPENV" "$ENV_FILE"
+trap - EXIT
+
+log_info ".env saved to $ENV_FILE"
 echo ""
 
 # ─── Register webhooks ────────────────────────────────────────────────────────
 
-echo "🔧 Registering webhooks in $REPO_COUNT repos..."
+log_info "Registering webhooks in $REPO_COUNT repo(s)..."
 echo ""
 
 SUCCESS=0; SKIP=0; FAIL=0
 
-while IFS= read -r FULL_REPO; do
+for FULL_REPO in "${REPOS[@]}"; do
   [[ -z "$FULL_REPO" ]] && continue
 
-  EXISTING=$(gh api "repos/$FULL_REPO/hooks" 2>/dev/null \
+  EXISTING="$(gh api "repos/$FULL_REPO/hooks" 2>/dev/null \
     | node -e "
-        const d = require('fs').readFileSync('/dev/stdin','utf8');
-        const h = JSON.parse(d).find(h => h.config?.url === '$SMEE_URL');
-        console.log(h ? h.id : '');
-      " 2>/dev/null || echo "")
+        process.stdin.resume();
+        const chunks = [];
+        process.stdin.on('data', c => chunks.push(c));
+        process.stdin.on('end', () => {
+          try {
+            const hooks = JSON.parse(chunks.join(''));
+            const h = Array.isArray(hooks) && hooks.find(h => h.config && h.config.url === process.argv[1]);
+            process.stdout.write(h ? String(h.id) : '');
+          } catch { process.stdout.write(''); }
+        });
+      " "$SMEE_URL" 2>/dev/null || echo "")"
 
   if [[ -n "$EXISTING" ]]; then
-    echo "  ⏭  $FULL_REPO — already registered (id: $EXISTING)"
-    ((SKIP++)) || true
+    log_info "  ⏭  $FULL_REPO — already registered (id: $EXISTING)"
+    (( SKIP++ )) || true
     continue
   fi
 
@@ -92,17 +138,17 @@ while IFS= read -r FULL_REPO; do
     --field "config[secret]=$WEBHOOK_SECRET" \
     --field "config[insecure_ssl]=0" \
     --silent 2>&1; then
-    echo "  ✅ $FULL_REPO"
-    ((SUCCESS++)) || true
+    log_info "  ✅ $FULL_REPO"
+    (( SUCCESS++ )) || true
   else
-    echo "  ❌ $FULL_REPO — check gh auth and repo access"
-    ((FAIL++)) || true
+    log_warn "  ❌ $FULL_REPO — check gh auth and repo access"
+    (( FAIL++ )) || true
   fi
-done <<< "$REPOS"
+done
 
 echo ""
 echo "────────────────────────────────────────"
-echo "Done: $SUCCESS created · $SKIP skipped · $FAIL failed"
+log_info "Done: $SUCCESS created · $SKIP skipped · $FAIL failed"
 echo ""
 echo "Next:"
 echo "  npm install"
