@@ -1,0 +1,10 @@
+{
+  "repos": [
+    "myorg/my-backend",
+    "myorg/my-frontend"
+  ],
+  "port": 7842,
+  "claudeAgent": "code-reviewer",
+  "claudeModel": "claude-sonnet-4-6",
+  "maxDiffBytes": 200000
+}
