@@ -6,5 +6,6 @@
   "port": 7842,
   "claudeAgent": "code-reviewer",
   "claudeModel": "claude-sonnet-4-6",
-  "maxDiffBytes": 200000
+  "maxDiffBytes": 200000,
+  "maxConcurrent": 2
 }
